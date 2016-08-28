@@ -20,13 +20,13 @@ A simple softmax model with one hidden layer is defined. The parameters
 ops are defined on a worker node. The TF sessions also run on the worker
 node.
 Multiple invocations of this script can be done in parallel, with different
-values for --worker_index. There should be exactly one invocation with
---worker_index, which will create a master session that carries out variable
+values for --task_index. There should be exactly one invocation with
+--task_index, which will create a master session that carries out variable
 initialization. The other, non-master, sessions will wait for the master
 session to finish the initialization before proceeding to the training stage.
 
 The coordination between the multiple worker invocations occurs due to
-the definition of the parameters on the same ps devices. The parameter updates
+the definition of the para  meters on the same ps devices. The parameter updates
 from one worker is visible to all other workers. As such, the workers can
 perform forward computation and gradient calculation in parallel, which
 should lead to increased training speed for the simple model.
@@ -41,48 +41,43 @@ import math
 import sys
 import tempfile
 import time
-import os
 
 import tensorflow as tf
 from tensorflow.examples.tutorials.mnist import input_data
 
 
 flags = tf.app.flags
-flags.DEFINE_string("data_dir", "mnist-data/",
+flags.DEFINE_string("data_dir", "/tmp/mnist-data",
                     "Directory for storing mnist data")
-flags.DEFINE_string("train_dir", "train_log/",
-                    "Directory for storing mnist data")
-flags.DEFINE_integer("steps_per_checkpoint", 10,
-                     "Save the checkpoint file for per 'steps_per_checkpoint' steps")
 flags.DEFINE_boolean("download_only", False,
                      "Only perform downloading of data; Do not proceed to "
                      "session preparation, model definition or training")
-flags.DEFINE_integer("worker_index", 0,
-                     "Worker task index, should be >= 0. worker_index=0 is "
+flags.DEFINE_integer("task_index", None,
+                     "Worker task index, should be >= 0. task_index=0 is "
                      "the master worker task the performs the variable "
                      "initialization ")
-flags.DEFINE_integer("num_workers", 2,
-                     "Total number of workers (must be >= 1)")
-flags.DEFINE_integer("num_parameter_servers", 1,
-                     "Total number of parameter servers (must be >= 1)")
+flags.DEFINE_integer("num_gpus", 1,
+                     "Total number of gpus for each machine."
+                     "If you don't   GPU, please set it to '0'")
 flags.DEFINE_integer("replicas_to_aggregate", None,
                      "Number of replicas to aggregate before parameter update"
                      "is applied (For sync_replicas mode only; default: "
                      "num_workers)")
-flags.DEFINE_integer("hidden_units", 1000,
+flags.DEFINE_integer("hidden_units", 100,
                      "Number of units in the hidden layer of the NN")
-flags.DEFINE_integer("train_steps", 1000,
+flags.DEFINE_integer("train_steps", 200,
                      "Number of (global) training steps to perform")
 flags.DEFINE_integer("batch_size", 100, "Training batch size")
 flags.DEFINE_float("learning_rate", 0.01, "Learning rate")
-flags.DEFINE_boolean("sync_replicas", True,
+flags.DEFINE_boolean("sync_replicas", False,
                      "Use the sync_replicas (synchronized replicas) mode, "
                      "wherein the parameter updates from workers are aggregated "
                      "before applied to avoid stale gradients")
-flags.DEFINE_string("job_name", "", "")
-flags.DEFINE_string("ps_hosts", "9.91.9.130:2222", "parameter servers hosts")
-flags.DEFINE_string("worker_hosts", "9.91.9.128:2223,9.91.9.130:2224", "parameter servers hosts")
-flags.DEFINE_integer("num_gpu", 4, "number of gpus in your each server")
+flags.DEFINE_string("ps_hosts","localhost:2222",
+                    "Comma-separated list of hostname:port pairs")
+flags.DEFINE_string("worker_hosts", "localhost:2223,localhost:2224", 
+                    "Comma-separated list of hostname:port pairs")
+flags.DEFINE_string("job_name", None,"job name: worker or ps")
 
 FLAGS = flags.FLAGS
 
@@ -93,56 +88,56 @@ PARAM_SERVER_PREFIX = "tf-ps"  # Prefix of the parameter servers' domain names
 WORKER_PREFIX = "tf-worker"  # Prefix of the workers' domain names
 
 
-def get_cluster_setter():
-  #ps_hosts = ["9.91.9.130:2222"]
-  #worker_hosts = ["9.91.9.128:2223", "9.91.9.130:2224"]
-  ps_hosts = FLAGS.ps_hosts.strip().split(',')
-  worker_hosts = FLAGS.worker_hosts.strip().split(',')
-
-  cluster = tf.train.ClusterSpec({"ps":ps_hosts, "worker":worker_hosts})
-  server = tf.train.Server(cluster,
-                            job_name=FLAGS.job_name,
-                            task_index=FLAGS.worker_index)
-  return server, cluster
-
 def main(unused_argv):
   mnist = input_data.read_data_sets(FLAGS.data_dir, one_hot=True)
   if FLAGS.download_only:
     sys.exit(0)
 
+  if FLAGS.job_name is None or FLAGS.job_name == "":
+    raise ValueError("Must specify an explicit `job_name`")
+  if FLAGS.task_index is None or FLAGS.task_index =="":
+    raise ValueError("Must specify an explicit `task_index`")
+
+  print("job name = %s" % FLAGS.job_name)
+  print("task index = %d" % FLAGS.task_index)
   
-  print("Worker index = %d" % FLAGS.worker_index)
-  print("Number of workers = %d" % FLAGS.num_workers)
+  #Construct the cluster and start the server
+  ps_spec = FLAGS.ps_hosts.split(",")
+  worker_spec = FLAGS.worker_hosts.split(",")
 
-  # Sanity check on the number of workers and the worker index
-  if FLAGS.worker_index >= FLAGS.num_workers:
-    raise ValueError("Worker index %d exceeds number of workers %d " %
-                     (FLAGS.worker_index, FLAGS.num_workers))
+  # Get the number of workers 
+  num_workers = len(worker_spec)
+  print(num_workers)
+  cluster = tf.train.ClusterSpec({
+      "ps": ps_spec,
+      "worker": worker_spec})
+  server = tf.train.Server(cluster,
+                           job_name=FLAGS.job_name,
+                           task_index=FLAGS.task_index)
 
-  # Sanity check on the number of parameter servers
-  if FLAGS.num_parameter_servers <= 0:
-    raise ValueError("Invalid num_parameter_servers value: %d" %
-                     FLAGS.num_parameter_servers)
-  
-  is_chief = (FLAGS.worker_index == 0)
-
-  if FLAGS.sync_replicas:
-    if FLAGS.replicas_to_aggregate is None:
-      replicas_to_aggregate = FLAGS.num_workers
-    else:
-      replicas_to_aggregate = FLAGS.replicas_to_aggregate
-
-  # Construct device setter object
-  #device_setter = get_device_setter_new()
-  server, cluster = get_cluster_setter()
   if FLAGS.job_name == "ps":
     server.join()
   elif FLAGS.job_name == "worker":
-    gpu_num = (FLAGS.worker_index + 1) % FLAGS.num_gpu
-    with tf.device(tf.train.replica_device_setter(cluster=cluster,
-#        worker_device="/job:worker/task:%d" % FLAGS.worker_index)):
-                  worker_device="/job:worker/task:%d/gpu:%d" % (FLAGS.worker_index, gpu_num))):
-
+    is_chief = (FLAGS.task_index == 0)
+    if FLAGS.num_gpus > 0:
+      if FLAGS.num_gpus < num_workers:
+        raise ValueError("number of gpus is less than number of workers")
+      # Avoid gpu allocation conflict: now allocate task_num -> #gpu 
+      # for each worker in the corresponding machine
+      gpu = (FLAGS.task_index % FLAGS.num_gpus)
+      worker_device = "/job:worker/task:%d/gpu:%d" % (FLAGS.task_index, gpu)
+    elif FLAGS.num_gpus == 0:
+      # Just allocate the CPU to worker server
+      cpu = FLAGS.task_index + 1
+      print("cpu=%d" % cpu)
+      worker_device = "/job:worker/task:%d/cpu:%d" % (FLAGS.task_index, cpu)
+    # The device setter will automatically place Variables ops on separate
+    # parameter servers (ps). The non-Variable ops will be placed on the workers.
+    # The ps use CPU and workers use corresponding GPU
+    with tf.device(tf.train.replica_device_setter(
+        worker_device=worker_device,
+        ps_device="/job:ps/cpu:0",
+        cluster=cluster)):
       global_step = tf.Variable(0, name="global_step", trainable=False)
 
       # Variables of the hidden layer
@@ -158,7 +153,7 @@ def main(unused_argv):
           name="sm_w")
       sm_b = tf.Variable(tf.zeros([10]), name="sm_b")
 
-      # Ops: located on the worker specified with FLAGS.worker_index
+      # Ops: located on the worker specified with FLAGS.task_index
       x = tf.placeholder(tf.float32, [None, IMAGE_PIXELS * IMAGE_PIXELS])
       y_ = tf.placeholder(tf.float32, [None, 10])
 
@@ -170,13 +165,18 @@ def main(unused_argv):
                                      tf.log(tf.clip_by_value(y, 1e-10, 1.0)))
 
       opt = tf.train.AdamOptimizer(FLAGS.learning_rate)
-
+      
       if FLAGS.sync_replicas:
+        if FLAGS.replicas_to_aggregate is None:
+          replicas_to_aggregate = num_workers
+        else:
+          replicas_to_aggregate = FLAGS.replicas_to_aggregate
+
         opt = tf.train.SyncReplicasOptimizer(
             opt,
             replicas_to_aggregate=replicas_to_aggregate,
-            total_num_replicas=FLAGS.num_workers,
-            replica_id=FLAGS.worker_index,
+            total_num_replicas=num_workers,
+            replica_id=FLAGS.task_index,
             name="mnist_sync_replicas")
 
       train_step = opt.minimize(cross_entropy,
@@ -188,36 +188,30 @@ def main(unused_argv):
         init_tokens_op = opt.get_init_tokens_op()
 
       init_op = tf.initialize_all_variables()
-      
-
-      logdir = FLAGS.train_dir
-      saver = tf.train.Saver()
-
+      train_dir = tempfile.mkdtemp()
       sv = tf.train.Supervisor(is_chief=is_chief,
-                               logdir=logdir,
+                               logdir=train_dir,
                                init_op=init_op,
                                recovery_wait_secs=1,
-                               saver=saver,
                                global_step=global_step)
 
-      
-      
       sess_config = tf.ConfigProto(
           allow_soft_placement=True,
-          log_device_placement=False)
+          log_device_placement=False,
+          device_filters=["/job:ps", "/job:worker/task:%d" % FLAGS.task_index])
 
-      # The chief worker (worker_index==0) session will prepare the session,
+      # The chief worker (task_index==0) session will prepare the session,
       # while the remaining workers will wait for the preparation to complete.
-      if is_chief & (FLAGS.job_name=="worker"):
-        print("Worker %d: Initializing session..." % FLAGS.worker_index)
+      if is_chief:
+        print("Worker %d: Initializing session..." % FLAGS.task_index)
       else:
         print("Worker %d: Waiting for session to be initialized..." %
-              FLAGS.worker_index)
+              FLAGS.task_index)
 
       sess = sv.prepare_or_wait_for_session(server.target,
                                             config=sess_config)
 
-      print("Worker %d: Session initialization complete." % FLAGS.worker_index)
+      print("Worker %d: Session initialization complete." % FLAGS.task_index)
 
       if FLAGS.sync_replicas and is_chief:
         # Chief worker will start the chief queue runner and call the init op
@@ -236,22 +230,12 @@ def main(unused_argv):
         train_feed = {x: batch_xs,
                       y_: batch_ys}
 
-        #print(train_feed)
         _, step = sess.run([train_step, global_step], feed_dict=train_feed)
         local_step += 1
 
         now = time.time()
-        val_feed = {x: mnist.validation.images,
-                  y_: mnist.validation.labels}
-        val_xent = sess.run(cross_entropy, feed_dict=val_feed)
-
-        print("Worker %d: cross entropy %.2f traniing step %d done (global step: %d)" %
-              (FLAGS.worker_index, val_xent, local_step, step))
-
-        if is_chief & (step %  FLAGS.steps_per_checkpoint == 0):
-          checkpoint_path = os.path.join(FLAGS.train_dir, "mnist.ckpt")
-          saver.save(sess, checkpoint_path, global_step=step)
-
+        print("%f: Worker %d: training step %d done (global step: %d)" %
+              (now, FLAGS.task_index, local_step, step))
 
         if step >= FLAGS.train_steps:
           break
@@ -260,7 +244,6 @@ def main(unused_argv):
       print("Training ends @ %f" % time_end)
       training_time = time_end - time_begin
       print("Training elapsed time: %f s" % training_time)
-
 
       # Validation feed
       val_feed = {x: mnist.validation.images,
